@@ -49,25 +49,32 @@ class SystemState(IntEnum):
 
 
 # CAN frame IDs from sygnal DBC files
-_ID_HEARTBEAT = 368          # 0x170 MCM -> UserApplication
-_ID_CONTROL_ENABLE = 96      # 0x60  UserApplication -> MCM
-_ID_CONTROL_ENABLE_RESP = 97 # 0x61  MCM -> UserApplication
-_ID_CONTROL_CMD = 352        # 0x160 UserApplication -> MCM
-_ID_CONTROL_CMD_RESP = 353   # 0x161 MCM -> UserApplication
-_ID_RELAY_CMD = 176          # 0xB0  UserApplication -> MCM
-_ID_RELAY_CMD_RESP = 177     # 0xB1  MCM -> UserApplication
+_ID_HEARTBEAT = 368  # 0x170 MCM -> UserApplication
+_ID_CONTROL_ENABLE = 96  # 0x60  UserApplication -> MCM
+_ID_CONTROL_ENABLE_RESP = 97  # 0x61  MCM -> UserApplication
+_ID_CONTROL_CMD = 352  # 0x160 UserApplication -> MCM
+_ID_CONTROL_CMD_RESP = 353  # 0x161 MCM -> UserApplication
+_ID_RELAY_CMD = 176  # 0xB0  UserApplication -> MCM
+_ID_RELAY_CMD_RESP = 177  # 0xB1  MCM -> UserApplication
 _ID_HEARTBEAT_CLEAR_SEED = 112  # 0x70 MCM -> UserApplication (fault clear challenge)
-_ID_HEARTBEAT_CLEAR_KEY = 127   # 0x7F UserApplication -> MCM (fault clear response)
+_ID_HEARTBEAT_CLEAR_KEY = 127  # 0x7F UserApplication -> MCM (fault clear response)
 
 _FAULT_CLEAR_XOR = 0xA5A5A5A5
 
-_USER_APP_IDS = {_ID_CONTROL_ENABLE, _ID_CONTROL_CMD, _ID_RELAY_CMD, _ID_HEARTBEAT_CLEAR_KEY}
+_USER_APP_IDS = {
+    _ID_CONTROL_ENABLE,
+    _ID_CONTROL_CMD,
+    _ID_RELAY_CMD,
+    _ID_HEARTBEAT_CLEAR_KEY,
+}
 
 
 class SubsystemState:
     """Per-subsystem MCM state machine with independent watchdog and fault clear."""
 
-    def __init__(self, subsystem_id: int, bus_address: int, watchdog_timeout_s: float) -> None:
+    def __init__(
+        self, subsystem_id: int, bus_address: int, watchdog_timeout_s: float
+    ) -> None:
         self.subsystem_id = subsystem_id
         self.bus_address = bus_address
         self.watchdog_timeout_s = watchdog_timeout_s
@@ -84,16 +91,25 @@ class SubsystemState:
             return
         logger.info(
             "Sub%d state transition: %s -> %s (%s)",
-            self.subsystem_id, self.state.name, new_state.name, reason,
+            self.subsystem_id,
+            self.state.name,
+            new_state.name,
+            reason,
         )
         self.state = new_state
 
     def handle_control_enable(self, decoded: dict) -> None:
         enable = int(decoded.get("Enable", 0))
         if self.estop_latched:
-            logger.warning("Sub%d: ControlEnable ignored: e-stop latched in FAIL_HARD", self.subsystem_id)
+            logger.warning(
+                "Sub%d: ControlEnable ignored: e-stop latched in FAIL_HARD",
+                self.subsystem_id,
+            )
         elif self.state == SystemState.FAIL_HARD:
-            logger.warning("Sub%d: ControlEnable ignored: FAIL_HARD state (non-estop)", self.subsystem_id)
+            logger.warning(
+                "Sub%d: ControlEnable ignored: FAIL_HARD state (non-estop)",
+                self.subsystem_id,
+            )
         elif enable == 1 and self.state == SystemState.HUMAN_CONTROL:
             self.transition(SystemState.MCM_CONTROL, "ControlEnable Enable=1")
         elif enable == 0 and self.state == SystemState.MCM_CONTROL:
@@ -106,7 +122,8 @@ class SubsystemState:
             if elapsed > self.watchdog_timeout_s:
                 logger.error(
                     "Sub%d watchdog timeout after %.0fms — transitioning to FAIL_HARD",
-                    self.subsystem_id, elapsed * 1000,
+                    self.subsystem_id,
+                    elapsed * 1000,
                 )
                 self.transition(SystemState.FAIL_HARD, "watchdog timeout")
                 return True
@@ -119,17 +136,24 @@ class SubsystemState:
         if self.state != SystemState.FAIL_HARD:
             return
         if self.fault_clear_seed == 0:
-            logger.warning("Sub%d: HeartbeatClearKey received but no seed published", self.subsystem_id)
+            logger.warning(
+                "Sub%d: HeartbeatClearKey received but no seed published",
+                self.subsystem_id,
+            )
             return
         reset_key = int(decoded.get("ResetKey", 0))
         expected_key = self.fault_clear_seed ^ _FAULT_CLEAR_XOR
         if reset_key != expected_key:
             logger.warning(
                 "Sub%d HeartbeatClearKey mismatch: expected 0x%08X, got 0x%08X",
-                self.subsystem_id, expected_key, reset_key,
+                self.subsystem_id,
+                expected_key,
+                reset_key,
             )
             return
-        logger.info("Sub%d: Fault clear key validated — clearing FAIL_HARD", self.subsystem_id)
+        logger.info(
+            "Sub%d: Fault clear key validated — clearing FAIL_HARD", self.subsystem_id
+        )
         self.estop_latched = False
         self.fault_clear_seed = 0
         self.last_rx_time = time.monotonic()
@@ -144,7 +168,10 @@ class SubsystemState:
             self.estop_latched = False
             self.transition(SystemState.HUMAN_CONTROL, "estop-release")
         else:
-            logger.warning("Sub%d: estop-release ignored: FAIL_HARD not caused by estop", self.subsystem_id)
+            logger.warning(
+                "Sub%d: estop-release ignored: FAIL_HARD not caused by estop",
+                self.subsystem_id,
+            )
 
 
 def _load_dbc() -> cantools.database.Database:
@@ -185,39 +212,45 @@ class McmSimulator:
     def _send_control_enable_response(self, decoded: dict) -> None:
         enabled = 1 if self._primary.state == SystemState.MCM_CONTROL else 0
         msg = self._db.get_message_by_name("ControlEnableResponse")
-        data = msg.encode({
-            "BusAddress": self._args.bus_address,
-            "SubSystemID": self._primary.subsystem_id,
-            "InterfaceID": int(decoded.get("InterfaceID", 0)),
-            "Enable": enabled,
-            "CRC": 0,
-        })
+        data = msg.encode(
+            {
+                "BusAddress": self._args.bus_address,
+                "SubSystemID": self._primary.subsystem_id,
+                "InterfaceID": int(decoded.get("InterfaceID", 0)),
+                "Enable": enabled,
+                "CRC": 0,
+            }
+        )
         frame = bytearray(data)
         apply_crc8(frame)
         self._send_frame(_ID_CONTROL_ENABLE_RESP, frame)
 
     def _send_control_command_response(self, decoded: dict) -> None:
         msg = self._db.get_message_by_name("ControlCommandResponse")
-        data = msg.encode({
-            "BusAddress": self._args.bus_address,
-            "SubSystemID": self._primary.subsystem_id,
-            "InterfaceID": int(decoded.get("InterfaceID", 0)),
-            "Count8": int(decoded.get("Count8", 0)),
-            "Value": float(decoded.get("Value", 0.0)),
-            "CRC": 0,
-        })
+        data = msg.encode(
+            {
+                "BusAddress": self._args.bus_address,
+                "SubSystemID": self._primary.subsystem_id,
+                "InterfaceID": int(decoded.get("InterfaceID", 0)),
+                "Count8": int(decoded.get("Count8", 0)),
+                "Value": float(decoded.get("Value", 0.0)),
+                "CRC": 0,
+            }
+        )
         frame = bytearray(data)
         apply_crc8(frame)
         self._send_frame(_ID_CONTROL_CMD_RESP, frame)
 
     def _send_relay_command_response(self, decoded: dict) -> None:
         msg = self._db.get_message_by_name("RelayCommandResponse")
-        data = msg.encode({
-            "BusAddress": int(decoded.get("BusAddress", self._args.bus_address)),
-            "SubsystemID": self._primary.subsystem_id,
-            "Enable": int(decoded.get("Enable", 0)),
-            "CRC": 0,
-        })
+        data = msg.encode(
+            {
+                "BusAddress": int(decoded.get("BusAddress", self._args.bus_address)),
+                "SubsystemID": self._primary.subsystem_id,
+                "Enable": int(decoded.get("Enable", 0)),
+                "CRC": 0,
+            }
+        )
         frame = bytearray(data)
         apply_crc8(frame)
         self._send_frame(_ID_RELAY_CMD_RESP, frame)
@@ -226,7 +259,11 @@ class McmSimulator:
         if self._bus is None:
             return
         try:
-            self._bus.send(can.Message(arbitration_id=frame_id, data=bytes(data), is_extended_id=False))
+            self._bus.send(
+                can.Message(
+                    arbitration_id=frame_id, data=bytes(data), is_extended_id=False
+                )
+            )
         except can.CanError as exc:
             logger.error("CAN send error (id=0x%03X): %s", frame_id, exc)
 
@@ -245,21 +282,23 @@ class McmSimulator:
         sub.counter = (sub.counter + 1) & 0xFFFF
         iface_state = 1 if sub.state == SystemState.MCM_CONTROL else 0
         msg = self._db.get_message_by_name("Heartbeat")
-        data = msg.encode({
-            "BusAddress": self._args.bus_address,
-            "SubsystemID": sub.subsystem_id,
-            "SystemState": int(sub.state),
-            "Count16": sub.counter,
-            "Interface0State": iface_state,
-            "Interface1State": iface_state,
-            "Interface2State": iface_state,
-            "Interface3State": iface_state,
-            "Interface4State": iface_state,
-            "Interface5State": iface_state,
-            "Interface6State": iface_state,
-            "OverallInterfaceState": iface_state,
-            "CRC": 0,
-        })
+        data = msg.encode(
+            {
+                "BusAddress": self._args.bus_address,
+                "SubsystemID": sub.subsystem_id,
+                "SystemState": int(sub.state),
+                "Count16": sub.counter,
+                "Interface0State": iface_state,
+                "Interface1State": iface_state,
+                "Interface2State": iface_state,
+                "Interface3State": iface_state,
+                "Interface4State": iface_state,
+                "Interface5State": iface_state,
+                "Interface6State": iface_state,
+                "OverallInterfaceState": iface_state,
+                "CRC": 0,
+            }
+        )
         frame = bytearray(data)
         apply_crc8(frame)
         self._send_frame(_ID_HEARTBEAT, frame)
@@ -272,12 +311,14 @@ class McmSimulator:
         """Publish HeartbeatClearSeed (0x70) with a random 32-bit seed for one subsystem."""
         sub.fault_clear_seed = random.getrandbits(32) or 1  # never zero
         msg = self._db.get_message_by_name("HeartbeatClearSeed")
-        data = msg.encode({
-            "BusAddress": self._args.bus_address,
-            "SubsystemID": sub.subsystem_id,
-            "ResetSeed": sub.fault_clear_seed,
-            "CRC": 0,
-        })
+        data = msg.encode(
+            {
+                "BusAddress": self._args.bus_address,
+                "SubsystemID": sub.subsystem_id,
+                "ResetSeed": sub.fault_clear_seed,
+                "CRC": 0,
+            }
+        )
         frame = bytearray(data)
         apply_crc8(frame)
         self._send_frame(_ID_HEARTBEAT_CLEAR_SEED, frame)
@@ -333,15 +374,17 @@ class McmSimulator:
         if frame[7] != generate_crc8(frame):
             logger.warning("Dropped frame 0x%03X: CRC mismatch", msg.arbitration_id)
             return
-        if msg.arbitration_id != _ID_HEARTBEAT_CLEAR_KEY:
-            # Fault clear key does NOT reset the watchdog — only control commands do.
-            for sub in self._subsystems:
-                sub.feed_watchdog()
         try:
             decoded = self._db.decode_message(msg.arbitration_id, bytes(frame))
         except Exception as exc:
             logger.warning("Failed to decode frame 0x%03X: %s", msg.arbitration_id, exc)
             return
+        if int(decoded.get("BusAddress", 0)) != self._args.bus_address:
+            return
+        if msg.arbitration_id != _ID_HEARTBEAT_CLEAR_KEY:
+            # Fault clear key does NOT reset the watchdog — only control commands do.
+            for sub in self._subsystems:
+                sub.feed_watchdog()
         if msg.arbitration_id == _ID_CONTROL_ENABLE:
             self._handle_control_enable(decoded)
             self._send_control_enable_response(decoded)
@@ -364,7 +407,9 @@ class McmSimulator:
         async with server:
             await server.serve_forever()
 
-    async def _handle_socket_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _handle_socket_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         try:
             data = await reader.readline()
             cmd = data.decode().strip()
@@ -381,7 +426,9 @@ class McmSimulator:
             elif cmd == "fail-sub0":
                 matching = [s for s in self._subsystems if s.subsystem_id == 0]
                 if matching:
-                    logger.error("Injecting partial failure: sub0 FAIL_HARD via Unix socket")
+                    logger.error(
+                        "Injecting partial failure: sub0 FAIL_HARD via Unix socket"
+                    )
                     matching[0].trigger_estop()
                     writer.write(b"ok\n")
                 else:
@@ -389,7 +436,9 @@ class McmSimulator:
             elif cmd == "fail-sub1":
                 matching = [s for s in self._subsystems if s.subsystem_id == 1]
                 if matching:
-                    logger.error("Injecting partial failure: sub1 FAIL_HARD via Unix socket")
+                    logger.error(
+                        "Injecting partial failure: sub1 FAIL_HARD via Unix socket"
+                    )
                     matching[0].trigger_estop()
                     writer.write(b"ok\n")
                 else:
@@ -412,6 +461,7 @@ class McmSimulator:
                     writer.write(b"sub1 not configured\n")
             elif cmd == "query":
                 import json as _json
+
                 states = {str(s.subsystem_id): s.state.name for s in self._subsystems}
                 writer.write((_json.dumps(states) + "\n").encode())
             else:
@@ -438,7 +488,9 @@ class McmSimulator:
             except (OSError, can.CanError) as exc:
                 logger.error(
                     "CAN bus unavailable (%s): %s — retrying in %.0fs",
-                    self._args.can_interface, exc, retry_delay,
+                    self._args.can_interface,
+                    exc,
+                    retry_delay,
                 )
                 time.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 30.0)
@@ -462,7 +514,9 @@ class McmSimulator:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Simulated MCM CAN node (sygnal protocol)")
+    parser = argparse.ArgumentParser(
+        description="Simulated MCM CAN node (sygnal protocol)"
+    )
     parser.add_argument("--can-interface", default="vcan0")
     # 2000ms default: Python asyncio event loop scheduling adds hundreds of ms
     # jitter that real MCM firmware doesn't have. Real hardware uses 200ms.
@@ -475,8 +529,15 @@ def _parse_args() -> argparse.Namespace:
         default=[0, 1],
         help="Comma-separated subsystem IDs to simulate (default: 0,1)",
     )
-    parser.add_argument("--socket-path", default="/tmp/simulated-mcm.sock")
-    return parser.parse_args()
+    parser.add_argument(
+        "--socket-path",
+        default=None,
+        help="Unix socket path for estop/query commands (default: /tmp/simulated-mcm-{bus_address}.sock)",
+    )
+    args = parser.parse_args()
+    if args.socket_path is None:
+        args.socket_path = f"/tmp/simulated-mcm-{args.bus_address}.sock"
+    return args
 
 
 def main() -> None:

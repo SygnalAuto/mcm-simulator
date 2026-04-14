@@ -14,10 +14,14 @@ from unittest.mock import AsyncMock, MagicMock
 import can
 
 from mcm_simulator.simulator import (
-    McmSimulator, SystemState,
-    _ID_CONTROL_CMD_RESP, _ID_HEARTBEAT,
-    _ID_HEARTBEAT_CLEAR_SEED, _ID_RELAY_CMD_RESP,
+    McmSimulator,
+    SystemState,
+    _ID_CONTROL_CMD_RESP,
+    _ID_HEARTBEAT,
+    _ID_HEARTBEAT_CLEAR_SEED,
+    _ID_RELAY_CMD_RESP,
     _FAULT_CLEAR_XOR,
+    _parse_args,
 )
 from mcm_simulator.crc8 import apply_crc8, generate_crc8
 
@@ -81,9 +85,16 @@ class TestControlEnableTransitions:
         # MCM boots FAIL_HARD; put in HUMAN_CONTROL first (as after fault clear)
         for s in sim._subsystems:
             s.state = SystemState.HUMAN_CONTROL
-        frame = _make_can_frame(sim._db, "ControlEnable", {
-            "BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 1,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 1,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 1,
+            },
+        )
         sim._handle_can_message(frame)
         assert all(s.state == SystemState.MCM_CONTROL for s in sim._subsystems)
 
@@ -91,9 +102,16 @@ class TestControlEnableTransitions:
         sim = _make_sim()
         for s in sim._subsystems:
             s.state = SystemState.MCM_CONTROL
-        frame = _make_can_frame(sim._db, "ControlEnable", {
-            "BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 0,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 1,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 0,
+            },
+        )
         sim._handle_can_message(frame)
         assert all(s.state == SystemState.HUMAN_CONTROL for s in sim._subsystems)
 
@@ -101,9 +119,16 @@ class TestControlEnableTransitions:
         sim = _make_sim()
         for s in sim._subsystems:
             s.state = SystemState.FAIL_HARD
-        frame = _make_can_frame(sim._db, "ControlEnable", {
-            "BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 1,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 1,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 1,
+            },
+        )
         sim._handle_can_message(frame)
         assert all(s.state == SystemState.FAIL_HARD for s in sim._subsystems)
 
@@ -111,6 +136,7 @@ class TestControlEnableTransitions:
 class TestWatchdog:
     def test_watchdog_triggers_fail_hard(self):
         import asyncio
+
         sim = _make_sim(args=_make_args(watchdog_timeout_ms=50))
         # Simulate last_rx_time far in the past
         for s in sim._subsystems:
@@ -140,16 +166,29 @@ class TestWatchdog:
         sub.state = SystemState.FAIL_HARD
         sub.fault_clear_seed = 0xAABBCCDD
         # Clear the fault
-        frame = _make_can_frame(sim._db, "HeartbeatClearKey", {
-            "BusAddress": 1, "SubsystemID": 0,
-            "ResetKey": 0xAABBCCDD ^ _FAULT_CLEAR_XOR,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "HeartbeatClearKey",
+            {
+                "BusAddress": 1,
+                "SubsystemID": 0,
+                "ResetKey": 0xAABBCCDD ^ _FAULT_CLEAR_XOR,
+            },
+        )
         sim._handle_can_message(frame)
         assert sub.state == SystemState.HUMAN_CONTROL
         # Simulate 0x160 commands arriving at 20Hz for 500ms
-        cmd_frame = _make_can_frame(sim._db, "ControlCommand", {
-            "BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Count8": 0, "Value": 0,
-        })
+        cmd_frame = _make_can_frame(
+            sim._db,
+            "ControlCommand",
+            {
+                "BusAddress": 1,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Count8": 0,
+                "Value": 0,
+            },
+        )
         for _ in range(10):
             time.sleep(0.05)
             sim._handle_can_message(cmd_frame)
@@ -161,9 +200,16 @@ class TestWatchdog:
         old_time = time.monotonic() - 0.5
         for s in sim._subsystems:
             s.last_rx_time = old_time
-        frame = _make_can_frame(sim._db, "ControlEnable", {
-            "BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 1,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 1,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 1,
+            },
+        )
         sim._handle_can_message(frame)
         assert all(s.last_rx_time > old_time for s in sim._subsystems)
 
@@ -171,6 +217,7 @@ class TestWatchdog:
 class TestEstopLatch:
     def test_estop_press_triggers_fail_hard(self):
         import asyncio
+
         sim = _make_sim()
 
         async def press():
@@ -186,6 +233,7 @@ class TestEstopLatch:
 
     def test_estop_release_clears_fail_hard(self):
         import asyncio
+
         sim = _make_sim()
         for s in sim._subsystems:
             s.state = SystemState.FAIL_HARD
@@ -204,6 +252,7 @@ class TestEstopLatch:
 
     def test_estop_release_does_not_clear_non_estop_fail_hard(self):
         import asyncio
+
         sim = _make_sim()
         for s in sim._subsystems:
             s.state = SystemState.FAIL_HARD
@@ -225,9 +274,16 @@ class TestEstopLatch:
         for s in sim._subsystems:
             s.state = SystemState.FAIL_HARD
             s.estop_latched = True
-        frame = _make_can_frame(sim._db, "ControlEnable", {
-            "BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 1,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 1,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 1,
+            },
+        )
         sim._handle_can_message(frame)
         assert all(s.state == SystemState.FAIL_HARD for s in sim._subsystems)
         assert all(s.estop_latched for s in sim._subsystems)
@@ -246,7 +302,9 @@ class TestHeartbeatPublishing:
         assert generate_crc8(raw) == raw[7]
         decoded = sim._db.decode_message(_ID_HEARTBEAT, bytes(raw))
         state_val = decoded["SystemState"]
-        assert (state_val.value if hasattr(state_val, "value") else int(state_val)) == SystemState.MCM_CONTROL
+        assert (
+            state_val.value if hasattr(state_val, "value") else int(state_val)
+        ) == SystemState.MCM_CONTROL
 
     def test_heartbeat_counter_increments(self):
         sim = _make_sim()
@@ -257,7 +315,11 @@ class TestHeartbeatPublishing:
         assert sub.counter == 3
 
     def test_heartbeat_crc_all_states(self):
-        for state in (SystemState.HUMAN_CONTROL, SystemState.MCM_CONTROL, SystemState.FAIL_HARD):
+        for state in (
+            SystemState.HUMAN_CONTROL,
+            SystemState.MCM_CONTROL,
+            SystemState.FAIL_HARD,
+        ):
             sim = _make_sim()
             sub = sim._subsystems[0]
             sub.state = state
@@ -270,6 +332,7 @@ class TestHeartbeatPublishing:
 class TestPartialFailure:
     def test_fail_sub0_command_sets_sub0_to_fail_hard_only(self):
         import asyncio
+
         sim = _make_sim()
         for s in sim._subsystems:
             s.state = SystemState.HUMAN_CONTROL
@@ -289,6 +352,7 @@ class TestPartialFailure:
 
     def test_fail_sub1_command_sets_sub1_to_fail_hard_only(self):
         import asyncio
+
         sim = _make_sim()
         for s in sim._subsystems:
             s.state = SystemState.HUMAN_CONTROL
@@ -327,10 +391,17 @@ class TestPartialFailure:
 class TestControlCommandResponse:
     def test_control_command_response_echoes_value_with_crc(self):
         sim = _make_sim()
-        frame = _make_can_frame(sim._db, "ControlCommand", {
-            "BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0,
-            "Count8": 7, "Value": 0.5,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "ControlCommand",
+            {
+                "BusAddress": 1,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Count8": 7,
+                "Value": 0.5,
+            },
+        )
         sim._handle_can_message(frame)
         assert sim._bus.send.called
         sent_msg: can.Message = sim._bus.send.call_args[0][0]
@@ -342,9 +413,15 @@ class TestControlCommandResponse:
 class TestRelayCommandResponse:
     def test_relay_command_response_with_correct_crc(self):
         sim = _make_sim()
-        frame = _make_can_frame(sim._db, "RelayCommand", {
-            "BusAddress": 1, "SubsystemID": 0, "Enable": 1,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "RelayCommand",
+            {
+                "BusAddress": 1,
+                "SubsystemID": 0,
+                "Enable": 1,
+            },
+        )
         sim._handle_can_message(frame)
         assert sim._bus.send.called
         sent_msg: can.Message = sim._bus.send.call_args[0][0]
@@ -361,10 +438,15 @@ class TestFaultClearProtocol:
         sub = sim._subsystems[0]
         sub.state = SystemState.FAIL_HARD
         sub.fault_clear_seed = 0x12345678
-        frame = _make_can_frame(sim._db, "HeartbeatClearKey", {
-            "BusAddress": 1, "SubsystemID": 0,
-            "ResetKey": 0x12345678 ^ _FAULT_CLEAR_XOR,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "HeartbeatClearKey",
+            {
+                "BusAddress": 1,
+                "SubsystemID": 0,
+                "ResetKey": 0x12345678 ^ _FAULT_CLEAR_XOR,
+            },
+        )
         sim._handle_can_message(frame)
         assert sub.state == SystemState.HUMAN_CONTROL
 
@@ -373,10 +455,15 @@ class TestFaultClearProtocol:
         sub = sim._subsystems[0]
         sub.state = SystemState.FAIL_HARD
         sub.fault_clear_seed = 0x12345678
-        frame = _make_can_frame(sim._db, "HeartbeatClearKey", {
-            "BusAddress": 1, "SubsystemID": 0,
-            "ResetKey": 0xDEADBEEF,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "HeartbeatClearKey",
+            {
+                "BusAddress": 1,
+                "SubsystemID": 0,
+                "ResetKey": 0xDEADBEEF,
+            },
+        )
         sim._handle_can_message(frame)
         assert sub.state == SystemState.FAIL_HARD
 
@@ -387,10 +474,15 @@ class TestFaultClearProtocol:
         sub.fault_clear_seed = 0xAABBCCDD
         old_time = sub.last_rx_time
         time.sleep(0.01)
-        frame = _make_can_frame(sim._db, "HeartbeatClearKey", {
-            "BusAddress": 1, "SubsystemID": 0,
-            "ResetKey": 0xAABBCCDD ^ _FAULT_CLEAR_XOR,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "HeartbeatClearKey",
+            {
+                "BusAddress": 1,
+                "SubsystemID": 0,
+                "ResetKey": 0xAABBCCDD ^ _FAULT_CLEAR_XOR,
+            },
+        )
         sim._handle_can_message(frame)
         assert sub.last_rx_time > old_time
 
@@ -400,10 +492,15 @@ class TestFaultClearProtocol:
         sub.state = SystemState.FAIL_HARD
         sub.estop_latched = True
         sub.fault_clear_seed = 0x11111111
-        frame = _make_can_frame(sim._db, "HeartbeatClearKey", {
-            "BusAddress": 1, "SubsystemID": 0,
-            "ResetKey": 0x11111111 ^ _FAULT_CLEAR_XOR,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "HeartbeatClearKey",
+            {
+                "BusAddress": 1,
+                "SubsystemID": 0,
+                "ResetKey": 0x11111111 ^ _FAULT_CLEAR_XOR,
+            },
+        )
         sim._handle_can_message(frame)
         assert sub.state == SystemState.HUMAN_CONTROL
         assert not sub.estop_latched
@@ -417,10 +514,15 @@ class TestFaultClearProtocol:
         for s in sim._subsystems:
             s.last_rx_time = old_time
         sim._subsystems[0].fault_clear_seed = 0x22222222
-        frame = _make_can_frame(sim._db, "HeartbeatClearKey", {
-            "BusAddress": 1, "SubsystemID": 0,
-            "ResetKey": 0x22222222 ^ _FAULT_CLEAR_XOR,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "HeartbeatClearKey",
+            {
+                "BusAddress": 1,
+                "SubsystemID": 0,
+                "ResetKey": 0x22222222 ^ _FAULT_CLEAR_XOR,
+            },
+        )
         sim._handle_can_message(frame)
         assert all(s.last_rx_time == old_time for s in sim._subsystems)
 
@@ -429,10 +531,15 @@ class TestFaultClearProtocol:
         sub = sim._subsystems[0]
         sub.state = SystemState.HUMAN_CONTROL
         sub.fault_clear_seed = 0x33333333
-        frame = _make_can_frame(sim._db, "HeartbeatClearKey", {
-            "BusAddress": 1, "SubsystemID": 0,
-            "ResetKey": 0x33333333 ^ _FAULT_CLEAR_XOR,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "HeartbeatClearKey",
+            {
+                "BusAddress": 1,
+                "SubsystemID": 0,
+                "ResetKey": 0x33333333 ^ _FAULT_CLEAR_XOR,
+            },
+        )
         sim._handle_can_message(frame)
         assert sub.state == SystemState.HUMAN_CONTROL
 
@@ -467,9 +574,16 @@ class TestInvalidCrc:
         old_time = time.monotonic() - 0.5
         for s in sim._subsystems:
             s.last_rx_time = old_time
-        frame = _make_can_frame(sim._db, "ControlEnable", {
-            "BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 1,
-        })
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 1,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 1,
+            },
+        )
         bad_data = bytearray(frame.data)
         bad_data[7] ^= 0xFF
         bad_frame = can.Message(
@@ -480,3 +594,91 @@ class TestInvalidCrc:
         sim._handle_can_message(bad_frame)
         assert all(s.last_rx_time == old_time for s in sim._subsystems)
         assert all(s.state == SystemState.HUMAN_CONTROL for s in sim._subsystems)
+
+
+class TestBusAddressFiltering:
+    def test_frame_with_wrong_bus_address_is_dropped(self):
+        """Frame addressed to a different MCM must not change state."""
+        sim = _make_sim(args=_make_args(bus_address=1))
+        for s in sim._subsystems:
+            s.state = SystemState.HUMAN_CONTROL
+        # BusAddress=2 — this MCM is address 1, should be ignored
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 2,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 1,
+            },
+        )
+        sim._handle_can_message(frame)
+        assert all(s.state == SystemState.HUMAN_CONTROL for s in sim._subsystems)
+
+    def test_foreign_address_frame_does_not_feed_watchdog(self):
+        """Frame addressed to a different MCM must not reset this MCM's watchdog."""
+        sim = _make_sim(args=_make_args(bus_address=1))
+        for s in sim._subsystems:
+            s.state = SystemState.HUMAN_CONTROL
+        old_time = time.monotonic() - 0.5
+        for s in sim._subsystems:
+            s.last_rx_time = old_time
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 2,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 1,
+            },
+        )
+        sim._handle_can_message(frame)
+        assert all(s.last_rx_time == old_time for s in sim._subsystems)
+
+    def test_frame_with_correct_bus_address_is_processed(self):
+        """Frame addressed to this MCM's bus address is processed normally."""
+        sim = _make_sim(args=_make_args(bus_address=3))
+        for s in sim._subsystems:
+            s.state = SystemState.HUMAN_CONTROL
+        old_time = time.monotonic() - 0.5
+        for s in sim._subsystems:
+            s.last_rx_time = old_time
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {
+                "BusAddress": 3,
+                "SubSystemID": 0,
+                "InterfaceID": 0,
+                "Enable": 1,
+            },
+        )
+        sim._handle_can_message(frame)
+        # Watchdog must be fed and state transitions happen
+        assert all(s.last_rx_time > old_time for s in sim._subsystems)
+        assert all(s.state == SystemState.MCM_CONTROL for s in sim._subsystems)
+
+
+class TestSocketPathDefault:
+    def test_default_socket_path_includes_bus_address(self, monkeypatch):
+        """Default socket path must be /tmp/simulated-mcm-{bus_address}.sock."""
+        monkeypatch.setattr("sys.argv", ["sim", "--bus-address", "2"])
+        args = _parse_args()
+        assert args.socket_path == "/tmp/simulated-mcm-2.sock"
+
+    def test_default_socket_path_uses_bus_address_1_when_default(self, monkeypatch):
+        """Default bus address 1 produces /tmp/simulated-mcm-1.sock."""
+        monkeypatch.setattr("sys.argv", ["sim"])
+        args = _parse_args()
+        assert args.socket_path == "/tmp/simulated-mcm-1.sock"
+
+    def test_explicit_socket_path_overrides_default(self, monkeypatch):
+        """Explicitly passing --socket-path must take precedence over the dynamic default."""
+        monkeypatch.setattr(
+            "sys.argv",
+            ["sim", "--bus-address", "3", "--socket-path", "/run/my-mcm.sock"],
+        )
+        args = _parse_args()
+        assert args.socket_path == "/run/my-mcm.sock"
