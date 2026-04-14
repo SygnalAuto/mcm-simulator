@@ -1,8 +1,6 @@
 # mcm-simulator
 
-Standalone Python package that emulates a sygnal MCM (Machine Control Module) on a SocketCAN interface. Designed for hardware-in-the-loop testing and CI pipelines across any project that speaks the sygnal CAN protocol.
-
-No ROS 2. No git submodules. No monorepo dependencies.
+Standalone Python package that emulates a sygnal MCM (Machine Control Module) on a SocketCAN interface. Install it anywhere, point it at a virtual or physical CAN bus, and get a fully functional MCM to test against — no external dependencies beyond `python-can` and `cantools`.
 
 ## What it does
 
@@ -124,7 +122,7 @@ asyncio.run(run_test())
 
 ## CRC8 Warning
 
-sygnal silently drops all frames with incorrect CRC — no error is logged, no diagnostic is emitted. If sygnal publishes no heartbeat topics after startup, run the CRC test vectors first:
+The MCM silently drops all frames with incorrect CRC — no error is logged, no diagnostic is emitted. If the simulator appears unresponsive after startup, run the CRC test vectors first:
 
 ```sh
 pytest tests/test_crc8.py -v
