@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcm-simulator"
+version = "0.1.0"
+description = "Standalone sygnal MCM simulator for CAN hardware-in-the-loop and CI testing"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "python-can>=4.3.0",
+    "cantools>=39.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcm_simulator*"]
+
+[tool.setuptools.package-data]
+mcm_simulator = ["dbc/*.dbc"]
+
+[project.scripts]
+mcm-simulator = "mcm_simulator.simulator:main"
