@@ -29,13 +29,16 @@ import logging
 import os
 import random
 import time
+from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 
 import can
 import cantools
 
+from mcm_simulator.config_store import ConfigStore
 from mcm_simulator.crc8 import apply_crc8, generate_crc8
+from mcm_simulator.device_config import DeviceSpec, parse_devices_spec
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,16 @@ _ID_RELAY_CMD_RESP = 177  # 0xB1  MCM -> UserApplication
 _ID_HEARTBEAT_CLEAR_SEED = 112  # 0x70 MCM -> UserApplication (fault clear challenge)
 _ID_HEARTBEAT_CLEAR_KEY = 127  # 0x7F UserApplication -> MCM (fault clear response)
 
+# Configuration protocol CAN IDs (same for MCM, CB, IO — filtered by BusAddress in frame)
+_ID_CONFIG_GETSET_CMD = 1024   # 0x400 UserApplication -> Device
+_ID_CONFIG_GETSET_RESP = 1025  # 0x401 Device -> UserApplication
+
+# Identify protocol CAN IDs (same for MCM, CB, IO — all respond to the same broadcast)
+_ID_IDENTIFY_CMD = 1536          # 0x600 UserApplication -> all devices (0-byte broadcast)
+_ID_IDENTIFY_RESP_MAIN = 1537    # 0x601 Device -> UserApplication (ProductID, serial, boot state)
+_ID_IDENTIFY_RESP_APP_VERSION = 1538  # 0x602 Device -> UserApplication (app firmware version)
+_ID_IDENTIFY_RESP_BL_VERSION = 1539   # 0x603 Device -> UserApplication (bootloader version)
+
 _FAULT_CLEAR_XOR = 0xA5A5A5A5
 
 _USER_APP_IDS = {
@@ -66,6 +79,15 @@ _USER_APP_IDS = {
     _ID_CONTROL_CMD,
     _ID_RELAY_CMD,
     _ID_HEARTBEAT_CLEAR_KEY,
+    _ID_IDENTIFY_CMD,
+    _ID_CONFIG_GETSET_CMD,
+}
+
+# Maps device product_type → Configuration.dbc filename prefix
+_CONFIG_DBC_BY_TYPE: dict[str, str] = {
+    "mcm": "mcm_Configuration.dbc",
+    "cb": "cb_Configuration.dbc",
+    "io": "io_Configuration.dbc",
 }
 
 
@@ -176,20 +198,77 @@ class SubsystemState:
 
 def _load_dbc() -> cantools.database.Database:
     db = cantools.database.Database()
-    for name in ("Heartbeat.dbc", "Control.dbc", "Relay.dbc"):
+    for name in ("Heartbeat.dbc", "Control.dbc", "Relay.dbc", "Identify.dbc"):
         db.add_dbc_file(str(_DBC_DIR / name))
     return db
+
+
+def _load_config_db(product_type: str) -> cantools.database.Database | None:
+    """Load the device-type-specific Configuration.dbc.  Returns None if not found."""
+    dbc_name = _CONFIG_DBC_BY_TYPE.get(product_type)
+    if dbc_name is None:
+        return None
+    dbc_path = _DBC_DIR / dbc_name
+    if not dbc_path.exists():
+        logger.warning("Configuration DBC not found: %s", dbc_path)
+        return None
+    db = cantools.database.Database()
+    db.add_dbc_file(str(dbc_path))
+    return db
+
+
+@dataclass
+class _DeviceNode:
+    """A single simulated Sygnal device: one bus address, N subsystems, one identity."""
+
+    spec: DeviceSpec
+    subsystems: list[SubsystemState] = field(default_factory=list)
+    config_db: cantools.database.Database | None = None
 
 
 class McmSimulator:
     def __init__(self, args: argparse.Namespace) -> None:
         self._args = args
-        subsystem_ids: list[int] = args.subsystem_ids
         watchdog_timeout_s = args.watchdog_timeout_ms / 1000.0
-        self._subsystems: list[SubsystemState] = [
-            SubsystemState(sid, args.bus_address, watchdog_timeout_s)
-            for sid in subsystem_ids
-        ]
+
+        # Build device nodes.  Prefer explicit --devices list; fall back to legacy
+        # --bus-address + --subsystem-ids for single-device backwards compatibility.
+        devices: list[DeviceSpec] | None = getattr(args, "devices", None)
+        if devices:
+            self._device_nodes: list[_DeviceNode] = [
+                _DeviceNode(
+                    spec=spec,
+                    subsystems=[
+                        SubsystemState(sid, spec.bus_address, watchdog_timeout_s)
+                        for sid in spec.subsystem_ids
+                    ],
+                )
+                for spec in devices
+            ]
+        else:
+            # Legacy single-device mode
+            bus_address: int = args.bus_address
+            subsystem_ids: list[int] = args.subsystem_ids
+            legacy_spec = DeviceSpec(
+                bus_address=bus_address,
+                product_type="mcm",
+                product_id=1,
+            )
+            legacy_subs = [
+                SubsystemState(sid, bus_address, watchdog_timeout_s)
+                for sid in subsystem_ids
+            ]
+            self._device_nodes = [_DeviceNode(spec=legacy_spec, subsystems=legacy_subs)]
+
+        # Load per-device-type config DBs
+        for node in self._device_nodes:
+            node.config_db = _load_config_db(node.spec.product_type)
+
+        # _subsystems stays as the primary device's subsystems for backwards compat.
+        # Existing control/watchdog/socket logic uses this.
+        self._subsystems: list[SubsystemState] = self._device_nodes[0].subsystems
+
+        self._config_store = ConfigStore()
         self._bus: can.BusABC | None = None
         self._db = _load_dbc()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -275,7 +354,12 @@ class McmSimulator:
         interval = 1.0 / self._args.heartbeat_rate_hz
         while True:
             await asyncio.sleep(interval)
-            for sub in self._subsystems:
+            self._publish_all_heartbeats()
+
+    def _publish_all_heartbeats(self) -> None:
+        """Publish heartbeats for every subsystem of every device node."""
+        for node in self._device_nodes:
+            for sub in node.subsystems:
                 self._publish_subsystem_heartbeat(sub)
 
     def _publish_subsystem_heartbeat(self, sub: SubsystemState) -> None:
@@ -284,7 +368,7 @@ class McmSimulator:
         msg = self._db.get_message_by_name("Heartbeat")
         data = msg.encode(
             {
-                "BusAddress": self._args.bus_address,
+                "BusAddress": sub.bus_address,  # Use sub's own address (multi-device safe)
                 "SubsystemID": sub.subsystem_id,
                 "SystemState": int(sub.state),
                 "Count16": sub.counter,
@@ -337,6 +421,150 @@ class McmSimulator:
             sub.handle_heartbeat_clear_key(decoded)
 
     # ------------------------------------------------------------------
+    # ConfigGetSet protocol
+    # ------------------------------------------------------------------
+
+    def _handle_config_command(self, msg: can.Message) -> None:
+        """Handle ConfigGetSetCommand (0x400): look up device by BusAddress, store or
+        retrieve the parameter value, and send ConfigGetSetResponse (0x401) for each
+        subsystem of the matching device.
+
+        Uses decode_choices=False so all values are raw integers (no NamedSignalValue).
+        """
+        # Find the device node matching the BusAddress in the frame.
+        # We peek at raw byte 0 (bits 0-6) for BusAddress to avoid decode overhead.
+        raw = bytearray(msg.data)
+        if len(raw) < 8:
+            raw.extend([0] * (8 - len(raw)))
+        bus_addr_raw = raw[0] & 0x7F  # bits 0-6
+
+        node: _DeviceNode | None = None
+        for n in self._device_nodes:
+            if n.spec.bus_address == bus_addr_raw:
+                node = n
+                break
+        if node is None or node.config_db is None:
+            return
+
+        try:
+            cmd_msg = node.config_db.get_message_by_name("ConfigGetSetCommand")
+            decoded = node.config_db.decode_message(
+                cmd_msg.frame_id, bytes(raw), decode_choices=False
+            )
+        except Exception as exc:
+            logger.warning("Failed to decode ConfigGetSetCommand: %s", exc)
+            return
+
+        section_id: int = int(decoded.get("Config_SectionID", 0))
+        iface_id: int = int(decoded.get("Config_InterfaceID", 0))
+        is_set: bool = bool(int(decoded.get("Config_GetSet", 0)))
+
+        # Find the active Config_ParameterID_* and Config_Value_* signals
+        param_key: str | None = None
+        param_id: int = 0
+        value_key: str | None = None
+        current_value: float = 0.0
+
+        for k, v in decoded.items():
+            if k.startswith("Config_ParameterID_") and param_key is None:
+                param_key = k
+                param_id = int(v)
+            elif k.startswith("Config_Value_") and value_key is None:
+                value_key = k
+                current_value = float(v)
+
+        if param_key is None or value_key is None:
+            logger.debug("No param/value signals in decoded ConfigGetSetCommand")
+            return
+
+        if is_set:
+            # Store for ALL subsystems under this device (config is device-wide,
+            # not per-subsystem, but we key by sub_id as received so each sub
+            # can independently track its own store if needed)
+            self._config_store.set(
+                bus_addr_raw, int(decoded.get("SubsystemID", 0)),
+                iface_id, section_id, param_id, current_value
+            )
+            stored_value = current_value
+        else:
+            # Retrieve the stored value (returns 0.0 if never set)
+            stored_value = self._config_store.get(
+                bus_addr_raw, int(decoded.get("SubsystemID", 0)),
+                iface_id, section_id, param_id
+            )
+
+        # Send ConfigGetSetResponse for each subsystem of this device
+        try:
+            resp_msg = node.config_db.get_message_by_name("ConfigGetSetResponse")
+            for sub in node.subsystems:
+                resp_signals = dict(decoded)
+                resp_signals["SubsystemID"] = sub.subsystem_id
+                resp_signals[value_key] = stored_value
+                resp_signals["CRC"] = 0
+                resp_raw = bytearray(resp_msg.encode(resp_signals))
+                apply_crc8(resp_raw)
+                self._send_frame(_ID_CONFIG_GETSET_RESP, resp_raw)
+        except Exception as exc:
+            logger.warning("Failed to encode ConfigGetSetResponse: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Identify protocol
+    # ------------------------------------------------------------------
+
+    def _handle_identify_command(self) -> None:
+        """Respond to IdentifyCommand (0x600) with identity frames for all devices.
+
+        Each device responds for each of its subsystems with three frames:
+          IdentifyResponseMain (0x601) — ProductID, serial, boot state
+          IdentifyResponseAppVersion (0x602) — app firmware version
+          IdentifyResponseBLVersion (0x603) — bootloader version
+
+        IdentifyCommand is a 0-byte broadcast; no CRC or bus address filtering.
+        """
+        resp_main = self._db.get_message_by_name("IdentifyResponseMain")
+        resp_app = self._db.get_message_by_name("IdentifyResponseAppVersion")
+        resp_bl = self._db.get_message_by_name("IdentifyResponseBLVersion")
+
+        for node in self._device_nodes:
+            spec = node.spec
+            for sub in node.subsystems:
+                # IdentifyResponseMain — no CRC field in this DBC message
+                main_data = resp_main.encode(
+                    {
+                        "BusAddress": spec.bus_address,
+                        "SubsystemID": sub.subsystem_id,
+                        "ModuleBootState": 1,  # 1 = running (not in bootloader)
+                        "ProductID": spec.product_id,
+                        "ModuleSerialNumber": spec.serial_number,
+                    }
+                )
+                self._send_frame(_ID_IDENTIFY_RESP_MAIN, bytearray(main_data))
+
+                # IdentifyResponseAppVersion — no CRC field
+                app_data = resp_app.encode(
+                    {
+                        "BusAddress": spec.bus_address,
+                        "SubsystemID": sub.subsystem_id,
+                        "SoftwareVersionMajor": spec.fw_major,
+                        "SoftwareVersionMinor": spec.fw_minor,
+                        "SoftwareVersionPatch": spec.fw_patch,
+                    }
+                )
+                self._send_frame(_ID_IDENTIFY_RESP_APP_VERSION, bytearray(app_data))
+
+                # IdentifyResponseBLVersion — no CRC field
+                bl_data = resp_bl.encode(
+                    {
+                        "BusAddress": spec.bus_address,
+                        "SubsystemID": sub.subsystem_id,
+                        "SoftwareVersionMajor": spec.bl_major,
+                        "SoftwareVersionMinor": spec.bl_minor,
+                        "SoftwareVersionPatch": spec.bl_patch,
+                    }
+                )
+                self._send_frame(_ID_IDENTIFY_RESP_BL_VERSION, bytearray(bl_data))
+
+    # ------------------------------------------------------------------
     # Watchdog
     # ------------------------------------------------------------------
 
@@ -368,12 +596,26 @@ class McmSimulator:
     def _handle_can_message(self, msg: can.Message) -> None:
         if msg.arbitration_id not in _USER_APP_IDS:
             return
+
+        # IdentifyCommand (0x600) is a 0-byte broadcast — no CRC, no bus address.
+        # Respond immediately for all device nodes and return.
+        if msg.arbitration_id == _ID_IDENTIFY_CMD:
+            self._handle_identify_command()
+            return
+
         frame = bytearray(msg.data)
         if len(frame) < 8:
             frame.extend([0] * (8 - len(frame)))
         if frame[7] != generate_crc8(frame):
             logger.warning("Dropped frame 0x%03X: CRC mismatch", msg.arbitration_id)
             return
+
+        # ConfigGetSetCommand uses device-type-specific DBC — address routing is
+        # handled inside _handle_config_command, so dispatch before the main decode.
+        if msg.arbitration_id == _ID_CONFIG_GETSET_CMD:
+            self._handle_config_command(msg)
+            return
+
         try:
             decoded = self._db.decode_message(msg.arbitration_id, bytes(frame))
         except Exception as exc:
@@ -522,12 +764,22 @@ def _parse_args() -> argparse.Namespace:
     # jitter that real MCM firmware doesn't have. Real hardware uses 200ms.
     parser.add_argument("--watchdog-timeout-ms", type=int, default=2000)
     parser.add_argument("--heartbeat-rate-hz", type=float, default=15.0)
+    parser.add_argument(
+        "--devices",
+        default=None,
+        help=(
+            "Comma-separated list of <address>:<type> device specs, e.g. '1:mcm,2:cb,3:io'. "
+            "When set, takes precedence over --bus-address and --subsystem-ids."
+        ),
+    )
+    # Legacy single-device flags — kept for backwards compatibility.
+    # Ignored when --devices is provided.
     parser.add_argument("--bus-address", type=int, default=1)
     parser.add_argument(
         "--subsystem-ids",
         type=lambda s: [int(x) for x in s.split(",")],
         default=[0, 1],
-        help="Comma-separated subsystem IDs to simulate (default: 0,1)",
+        help="Comma-separated subsystem IDs to simulate (default: 0,1). Ignored if --devices is set.",
     )
     parser.add_argument(
         "--socket-path",
@@ -535,6 +787,13 @@ def _parse_args() -> argparse.Namespace:
         help="Unix socket path for estop/query commands (default: /tmp/simulated-mcm-{bus_address}.sock)",
     )
     args = parser.parse_args()
+
+    # Parse --devices string into list[DeviceSpec] if provided
+    if args.devices is not None:
+        args.devices = parse_devices_spec(args.devices)
+    else:
+        args.devices = None
+
     if args.socket_path is None:
         args.socket_path = f"/tmp/simulated-mcm-{args.bus_address}.sock"
     return args
