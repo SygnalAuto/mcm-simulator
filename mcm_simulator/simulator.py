@@ -30,6 +30,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
+from collections.abc import Callable
 from enum import IntEnum
 from pathlib import Path
 
@@ -48,6 +49,9 @@ _DBC_DIR = Path(__file__).parent / "dbc"
 class SystemState(IntEnum):
     HUMAN_CONTROL = 0
     MCM_CONTROL = 1
+    FAIL_OPERATIONAL_1 = 241   # 0xF1 — enum only; sim never enters organically
+    FAIL_OPERATIONAL_2 = 242   # 0xF2 — enum only; sim never enters organically
+    HUMAN_OVERRIDE = 253       # 0xFD — enum only; sim has no analog signal path
     FAIL_HARD = 254
 
 
@@ -59,8 +63,14 @@ _ID_CONTROL_CMD = 352  # 0x160 UserApplication -> MCM
 _ID_CONTROL_CMD_RESP = 353  # 0x161 MCM -> UserApplication
 _ID_RELAY_CMD = 176  # 0xB0  UserApplication -> MCM
 _ID_RELAY_CMD_RESP = 177  # 0xB1  MCM -> UserApplication
-_ID_HEARTBEAT_CLEAR_SEED = 112  # 0x70 MCM -> UserApplication (fault clear challenge)
-_ID_HEARTBEAT_CLEAR_KEY = 127  # 0x7F UserApplication -> MCM (fault clear response)
+_ID_FAULT_STATE = 32             # 0x20  MCM -> UserApplication (current fault state)
+_ID_FAULT_INCREMENT = 33         # 0x21  MCM -> UserApplication (fault occurrence)
+_ID_ERROR_STATUS = 48            # 0x30  MCM -> UserApplication (config error)
+_ID_HEARTBEAT_CLEAR_SEED = 112   # 0x70  MCM -> UserApplication (fault clear challenge)
+_ID_HEARTBEAT_CLEAR_KEY = 127    # 0x7F  UserApplication -> MCM (fault clear response)
+_ID_FAULT_LIST = 544             # 0x220 MCM -> UserApplication (fault list)
+_ID_FAULT_ROOT_CAUSE = 545       # 0x221 MCM -> UserApplication (fault root cause)
+_ID_REPORT_DATA = 1792           # 0x700 MCM -> UserApplication (telemetry signal)
 
 # Configuration protocol CAN IDs (same for MCM, CB, IO — filtered by BusAddress in frame)
 _ID_CONFIG_GETSET_CMD = 1024   # 0x400 UserApplication -> Device
@@ -107,6 +117,14 @@ class SubsystemState:
         self.counter: int = 0
         self.last_rx_time: float = time.monotonic()
         self.fault_clear_seed: int = random.randint(0, 0xFFFFFFFF)
+        self.fault_count: int = 0
+        self.fault_cause: int = 0
+        self.on_fault_increment: Callable[[SubsystemState], None] | None = None
+
+    # Official MCM fault source IDs (from Sygnal firmware documentation)
+    _FAULT_CAUSE_ESTOP = 0x01       # Emergency Stop
+    _FAULT_CAUSE_EXTERNAL = 0x02    # External Fault
+    _FAULT_CAUSE_WATCHDOG = 0x30    # Customer Application Heartbeat Timeout
 
     def transition(self, new_state: SystemState, reason: str) -> None:
         if new_state == self.state:
@@ -118,6 +136,19 @@ class SubsystemState:
             new_state.name,
             reason,
         )
+        if new_state == SystemState.FAIL_HARD:
+            self.fault_count += 1
+            if "watchdog" in reason.lower():
+                self.fault_cause = self._FAULT_CAUSE_WATCHDOG
+            elif "estop" in reason.lower() or "e-stop" in reason.lower():
+                self.fault_cause = self._FAULT_CAUSE_ESTOP
+            else:
+                self.fault_cause = 255  # unknown
+            if self.on_fault_increment is not None:
+                self.on_fault_increment(self)
+        elif self.state == SystemState.FAIL_HARD:
+            # Clearing fault — reset cause
+            self.fault_cause = 0
         self.state = new_state
 
     def handle_control_enable(self, decoded: dict) -> None:
@@ -196,9 +227,27 @@ class SubsystemState:
             )
 
 
+def _is_fault_state(state: SystemState) -> bool:
+    """Return True for states in which the MCM is actively faulted.
+
+    Used to gate FaultState (0x20), FaultList (0x220), FaultRootCause (0x221),
+    and HeartbeatClearSeed (0x70) emission — those frames are only sent while
+    the device is in a fault condition per sygnal_docs v2.1.1.
+    """
+    return state in (
+        SystemState.FAIL_HARD,
+        SystemState.FAIL_OPERATIONAL_1,
+        SystemState.FAIL_OPERATIONAL_2,
+        SystemState.HUMAN_OVERRIDE,
+    )
+
+
 def _load_dbc() -> cantools.database.Database:
     db = cantools.database.Database()
-    for name in ("Heartbeat.dbc", "Control.dbc", "Relay.dbc", "Identify.dbc"):
+    for name in (
+        "Heartbeat.dbc", "Control.dbc", "Relay.dbc", "Identify.dbc",
+        "Fault.dbc", "Report.dbc", "Error.dbc",
+    ):
         db.add_dbc_file(str(_DBC_DIR / name))
     return db
 
@@ -276,6 +325,11 @@ class McmSimulator:
         self._heartbeat_task: asyncio.Task | None = None
         self._socket_task: asyncio.Task | None = None
 
+        # Wire fault increment callback so transitions publish FaultIncrement frames
+        for node in self._device_nodes:
+            for sub in node.subsystems:
+                sub.on_fault_increment = self._publish_fault_increment
+
     @property
     def _primary(self) -> SubsystemState:
         return self._subsystems[0]
@@ -289,50 +343,53 @@ class McmSimulator:
             sub.handle_control_enable(decoded)
 
     def _send_control_enable_response(self, decoded: dict) -> None:
-        enabled = 1 if self._primary.state == SystemState.MCM_CONTROL else 0
         msg = self._db.get_message_by_name("ControlEnableResponse")
-        data = msg.encode(
-            {
-                "BusAddress": self._args.bus_address,
-                "SubSystemID": self._primary.subsystem_id,
-                "InterfaceID": int(decoded.get("InterfaceID", 0)),
-                "Enable": enabled,
-                "CRC": 0,
-            }
-        )
-        frame = bytearray(data)
-        apply_crc8(frame)
-        self._send_frame(_ID_CONTROL_ENABLE_RESP, frame)
+        for sub in self._subsystems:
+            enabled = 1 if sub.state == SystemState.MCM_CONTROL else 0
+            data = msg.encode(
+                {
+                    "BusAddress": self._args.bus_address,
+                    "SubSystemID": sub.subsystem_id,
+                    "InterfaceID": int(decoded.get("InterfaceID", 0)),
+                    "Enable": enabled,
+                    "CRC": 0,
+                }
+            )
+            frame = bytearray(data)
+            apply_crc8(frame)
+            self._send_frame(_ID_CONTROL_ENABLE_RESP, frame)
 
     def _send_control_command_response(self, decoded: dict) -> None:
         msg = self._db.get_message_by_name("ControlCommandResponse")
-        data = msg.encode(
-            {
-                "BusAddress": self._args.bus_address,
-                "SubSystemID": self._primary.subsystem_id,
-                "InterfaceID": int(decoded.get("InterfaceID", 0)),
-                "Count8": int(decoded.get("Count8", 0)),
-                "Value": float(decoded.get("Value", 0.0)),
-                "CRC": 0,
-            }
-        )
-        frame = bytearray(data)
-        apply_crc8(frame)
-        self._send_frame(_ID_CONTROL_CMD_RESP, frame)
+        for sub in self._subsystems:
+            data = msg.encode(
+                {
+                    "BusAddress": self._args.bus_address,
+                    "SubSystemID": sub.subsystem_id,
+                    "InterfaceID": int(decoded.get("InterfaceID", 0)),
+                    "Count8": int(decoded.get("Count8", 0)),
+                    "Value": float(decoded.get("Value", 0.0)),
+                    "CRC": 0,
+                }
+            )
+            frame = bytearray(data)
+            apply_crc8(frame)
+            self._send_frame(_ID_CONTROL_CMD_RESP, frame)
 
     def _send_relay_command_response(self, decoded: dict) -> None:
         msg = self._db.get_message_by_name("RelayCommandResponse")
-        data = msg.encode(
-            {
-                "BusAddress": int(decoded.get("BusAddress", self._args.bus_address)),
-                "SubsystemID": self._primary.subsystem_id,
-                "Enable": int(decoded.get("Enable", 0)),
-                "CRC": 0,
-            }
-        )
-        frame = bytearray(data)
-        apply_crc8(frame)
-        self._send_frame(_ID_RELAY_CMD_RESP, frame)
+        for sub in self._subsystems:
+            data = msg.encode(
+                {
+                    "BusAddress": int(decoded.get("BusAddress", self._args.bus_address)),
+                    "SubsystemID": sub.subsystem_id,
+                    "Enable": int(decoded.get("Enable", 0)),
+                    "CRC": 0,
+                }
+            )
+            frame = bytearray(data)
+            apply_crc8(frame)
+            self._send_frame(_ID_RELAY_CMD_RESP, frame)
 
     def _send_frame(self, frame_id: int, data: bytearray) -> None:
         if self._bus is None:
@@ -357,10 +414,12 @@ class McmSimulator:
             self._publish_all_heartbeats()
 
     def _publish_all_heartbeats(self) -> None:
-        """Publish heartbeats for every subsystem of every device node."""
+        """Publish heartbeats and (when faulted) fault state for every subsystem."""
         for node in self._device_nodes:
             for sub in node.subsystems:
                 self._publish_subsystem_heartbeat(sub)
+                if _is_fault_state(sub.state):
+                    self._publish_subsystem_fault_state(sub)
 
     def _publish_subsystem_heartbeat(self, sub: SubsystemState) -> None:
         sub.counter = (sub.counter + 1) & 0xFFFF
@@ -388,6 +447,150 @@ class McmSimulator:
         self._send_frame(_ID_HEARTBEAT, frame)
 
     # ------------------------------------------------------------------
+    # Diagnostic frame publishers
+    # ------------------------------------------------------------------
+
+    def _publish_subsystem_fault_state(self, sub: SubsystemState) -> None:
+        """Publish FaultState (0x20) for one subsystem."""
+        msg = self._db.get_message_by_name("FaultState")
+        data = msg.encode(
+            {
+                "BusAddress": sub.bus_address,
+                "SubsystemID": sub.subsystem_id,
+                "FaultState": int(sub.state),
+                "FaultCause": sub.fault_cause,
+                "CRC": 0,
+            }
+        )
+        frame = bytearray(data)
+        apply_crc8(frame)
+        self._send_frame(_ID_FAULT_STATE, frame)
+
+    def _publish_fault_increment(self, sub: SubsystemState) -> None:
+        """Publish FaultIncrement (0x21) — called once per fault transition."""
+        msg = self._db.get_message_by_name("FaultIncrement")
+        data = msg.encode(
+            {
+                "BusAddress": sub.bus_address,
+                "SubsystemID": sub.subsystem_id,
+                "FaultType": sub.fault_cause,
+                "FaultCount": sub.fault_count,
+                "CRC": 0,
+            }
+        )
+        frame = bytearray(data)
+        apply_crc8(frame)
+        self._send_frame(_ID_FAULT_INCREMENT, frame)
+
+    def _publish_report_signal(
+        self,
+        bus_address: int,
+        subsystem_id: int,
+        interface_id: int,
+        signal_id: int,
+        value: float,
+    ) -> None:
+        """Publish a single ReportData (0x700) frame."""
+        msg = self._db.get_message_by_name("ReportData")
+        data = msg.encode(
+            {
+                "BusAddress": bus_address,
+                "SubsystemID": subsystem_id,
+                "InterfaceID": interface_id,
+                "Report_SignalID": signal_id,
+                "Report_Value_FLOAT32": value,
+                "CRC": 0,
+            }
+        )
+        frame = bytearray(data)
+        apply_crc8(frame)
+        self._send_frame(_ID_REPORT_DATA, frame)
+
+    def _publish_error_status(
+        self,
+        bus_address: int,
+        subsystem_id: int,
+        error_type: int,
+        section_id: int,
+        interface_id: int,
+        can_id: int,
+    ) -> None:
+        """Publish ErrorStatus (0x30) frame."""
+        msg = self._db.get_message_by_name("ErrorStatus")
+        data = msg.encode(
+            {
+                "BusAddress": bus_address,
+                "SubsystemID": subsystem_id,
+                "Error_Type": error_type,
+                "Config_SectionID": section_id,
+                "Config_InterfaceID": interface_id,
+                "Error_CANID": can_id,
+                "CRC": 0,
+            }
+        )
+        frame = bytearray(data)
+        apply_crc8(frame)
+        self._send_frame(_ID_ERROR_STATUS, frame)
+
+    # ------------------------------------------------------------------
+    # Report data loop (synthetic telemetry)
+    # ------------------------------------------------------------------
+
+    # Report_SignalID values to broadcast — all from sygnal_docs v2.1.1 §Report.
+    # TODO: per-signal rate config via ConfigGetSet Section 31 (Report) is deferred;
+    #       this always-on broadcast diverges from the docs' opt-in model (see audit).
+    _REPORT_SIGNALS: list[tuple[int, str]] = [
+        (0x80, "Signal Input"),
+        (0x81, "Signal Output Actual"),
+        (0x83, "Signal Output Target"),
+        (0x50, "Feedback Raw"),
+        (0x52, "Closed Loop Setpoint"),
+        (0x40, "Override State"),
+    ]
+
+    async def _report_data_loop(self) -> None:
+        """Publish synthetic ReportData signals at the configured rate."""
+        interval = 1.0 / self._args.report_rate_hz
+        tick = 0
+        while True:
+            await asyncio.sleep(interval)
+            tick += 1
+            for node in self._device_nodes:
+                for sub in node.subsystems:
+                    for signal_id, _ in self._REPORT_SIGNALS:
+                        value = self._synthetic_value(signal_id, tick)
+                        self._publish_report_signal(
+                            bus_address=sub.bus_address,
+                            subsystem_id=sub.subsystem_id,
+                            interface_id=0,
+                            signal_id=signal_id,
+                            value=value,
+                        )
+
+    @staticmethod
+    def _synthetic_value(signal_id: int, tick: int) -> float:
+        """Generate a plausible synthetic value for a given signal.
+
+        Values are keyed to documented Signal IDs (mcm-can-api-guide.md §Report).
+        ADC scale is 0–4096 (12-bit) per signal-reporting.md.
+        """
+        import math  # local import to avoid top-level dependency
+
+        if signal_id in (0x80, 0x81, 0x83):
+            # Signal Input / Output Actual / Output Target: sine over 12-bit ADC range
+            return 2048.0 + 2048.0 * math.sin(tick * 0.05 + signal_id * 0.3)
+        if signal_id == 0x50:
+            # Feedback Raw: faster sine centred at midscale
+            return 2048.0 + 2048.0 * math.sin(tick * 0.1)
+        if signal_id == 0x52:
+            # Closed Loop Setpoint: step between 0.0 and 1.0
+            return 1.0 if (tick // 50) % 2 == 0 else 0.0
+        if signal_id == 0x40:
+            # Override State: always Normal (0) — sim has no HUO detection
+            return 0.0
+        return 0.0
+
+    # ------------------------------------------------------------------
     # Fault clear (challenge-response protocol)
     # ------------------------------------------------------------------
 
@@ -407,12 +610,63 @@ class McmSimulator:
         apply_crc8(frame)
         self._send_frame(_ID_HEARTBEAT_CLEAR_SEED, frame)
 
+    def _publish_fault_list(self, sub: SubsystemState) -> None:
+        """Publish FaultList (0x220) for one subsystem.
+
+        Emits one frame for the current fault_cause if fault_count > 0.
+        Real MCM emits one frame per non-zero cause; sim tracks a single
+        cause so at most one frame per tick. See docs compliance audit.
+        """
+        if sub.fault_count == 0:
+            return
+        msg = self._db.get_message_by_name("FaultList")
+        data = msg.encode(
+            {
+                "BusAddress": sub.bus_address,
+                "SubsystemID": sub.subsystem_id,
+                "FaultType": sub.fault_cause,
+                "FaultCount": sub.fault_count,
+                "CRC": 0,
+            }
+        )
+        frame = bytearray(data)
+        apply_crc8(frame)
+        self._send_frame(_ID_FAULT_LIST, frame)
+
+    def _publish_fault_root_cause(self, sub: SubsystemState) -> None:
+        """Publish FaultRootCause (0x221) for one subsystem.
+
+        Fills FailHardCause from sub.fault_cause; FailOp1/2 are always 0
+        since the sim never enters those states organically.
+        """
+        fail_hard_cause = sub.fault_cause if sub.state == SystemState.FAIL_HARD else 0
+        msg = self._db.get_message_by_name("FaultRootCause")
+        data = msg.encode(
+            {
+                "BusAddress": sub.bus_address,
+                "SubsystemID": sub.subsystem_id,
+                "FailOp1Cause": 0,
+                "FailOp2Cause": 0,
+                "FailHardCause": fail_hard_cause,
+                "CRC": 0,
+            }
+        )
+        frame = bytearray(data)
+        apply_crc8(frame)
+        self._send_frame(_ID_FAULT_ROOT_CAUSE, frame)
+
     async def _fault_clear_seed_loop(self) -> None:
-        """Publish fault clear seeds every 500ms while any subsystem is in FAIL_HARD."""
+        """Publish fault-state diagnostic frames at the seed rate (500ms).
+
+        Emits HeartbeatClearSeed, FaultList, and FaultRootCause for each
+        subsystem that is in an active fault state.
+        """
         while True:
             for sub in self._subsystems:
-                if sub.state == SystemState.FAIL_HARD:
+                if _is_fault_state(sub.state):
                     self._publish_subsystem_fault_clear_seed(sub)
+                    self._publish_fault_list(sub)
+                    self._publish_fault_root_cause(sub)
             await asyncio.sleep(0.5)
 
     def _handle_heartbeat_clear_key(self, decoded: dict) -> None:
@@ -446,18 +700,44 @@ class McmSimulator:
         if node is None or node.config_db is None:
             return
 
+        # Peek section_id / interface_id from raw bytes (before decode) so we can
+        # validate and emit ErrorStatus even when the multiplexed DBC decode fails.
+        # Byte 1: InterfaceID[7:5], SectionID[4:0]
+        section_id_raw: int = raw[1] & 0x1F
+        iface_id_raw: int = (raw[1] >> 5) & 0x07
+        sub_id_raw: int = (raw[0] >> 7) & 0x01
+
         try:
             cmd_msg = node.config_db.get_message_by_name("ConfigGetSetCommand")
             decoded = node.config_db.decode_message(
                 cmd_msg.frame_id, bytes(raw), decode_choices=False
             )
         except Exception as exc:
+            # Decode fails for unknown/invalid section IDs (mux ID out of range).
             logger.warning("Failed to decode ConfigGetSetCommand: %s", exc)
+            self._publish_error_status(
+                bus_address=bus_addr_raw, subsystem_id=sub_id_raw,
+                error_type=2, section_id=section_id_raw, interface_id=iface_id_raw,
+                can_id=_ID_CONFIG_GETSET_CMD,
+            )
             return
 
         section_id: int = int(decoded.get("Config_SectionID", 0))
         iface_id: int = int(decoded.get("Config_InterfaceID", 0))
         is_set: bool = bool(int(decoded.get("Config_GetSet", 0)))
+        sub_id: int = int(decoded.get("SubsystemID", 0))
+
+        # Physical interfaces are 0-6 (7 virtual interfaces per overview.md)
+        if iface_id > 6:
+            logger.warning(
+                "ConfigGetSet: interface ID %d > 6 — emitting ErrorStatus", iface_id
+            )
+            self._publish_error_status(
+                bus_address=bus_addr_raw, subsystem_id=sub_id,
+                error_type=3, section_id=section_id, interface_id=iface_id,
+                can_id=_ID_CONFIG_GETSET_CMD,
+            )
+            return
 
         # Find the active Config_ParameterID_* and Config_Value_* signals
         param_key: str | None = None
@@ -569,8 +849,8 @@ class McmSimulator:
     # ------------------------------------------------------------------
 
     async def _watchdog_loop(self) -> None:
-        # Check every 50ms; trigger FAIL_HARD if gap exceeds watchdog_timeout_ms
-        check_interval = 0.050
+        # 10ms check interval: leaves ~170ms slack under the 200ms default watchdog.
+        check_interval = 0.010
         while True:
             await asyncio.sleep(check_interval)
             for sub in self._subsystems:
@@ -584,10 +864,10 @@ class McmSimulator:
         loop = asyncio.get_running_loop()
         while True:
             try:
-                msg = await loop.run_in_executor(None, self._bus.recv, 0.1)
+                msg = await loop.run_in_executor(None, self._bus.recv, 0.02)
             except Exception as exc:
                 logger.error("CAN recv error: %s", exc)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.02)
                 continue
             if msg is None:
                 continue
@@ -608,6 +888,16 @@ class McmSimulator:
             frame.extend([0] * (8 - len(frame)))
         if frame[7] != generate_crc8(frame):
             logger.warning("Dropped frame 0x%03X: CRC mismatch", msg.arbitration_id)
+            # Emit ErrorStatus(Error_Type=1 CRC Error) per docs. SubsystemID unknown before
+            # decode, so use 0 and primary device's bus_address.
+            self._publish_error_status(
+                bus_address=self._args.bus_address,
+                subsystem_id=0,
+                error_type=1,
+                section_id=0,
+                interface_id=0,
+                can_id=msg.arbitration_id,
+            )
             return
 
         # ConfigGetSetCommand uses device-type-specific DBC — address routing is
@@ -623,10 +913,32 @@ class McmSimulator:
             return
         if int(decoded.get("BusAddress", 0)) != self._args.bus_address:
             return
+
+        # For control/relay frames, check fault state BEFORE feeding the watchdog.
+        # If any subsystem is faulted: emit ErrorStatus(State Error) per sub,
+        # skip watchdog feed, and skip the normal response handler.
+        # Docs: "Control messages are only acted upon if the device isn't in an
+        # override OR fault state." (mcm-can-api-guide.md)
+        _control_ids = {_ID_CONTROL_ENABLE, _ID_CONTROL_CMD, _ID_RELAY_CMD}
+        if msg.arbitration_id in _control_ids:
+            faulted_subs = [s for s in self._subsystems if _is_fault_state(s.state)]
+            if faulted_subs:
+                for sub in faulted_subs:
+                    self._publish_error_status(
+                        bus_address=self._args.bus_address,
+                        subsystem_id=sub.subsystem_id,
+                        error_type=6,  # State Error
+                        section_id=0,
+                        interface_id=int(decoded.get("InterfaceID", 0)),
+                        can_id=msg.arbitration_id,
+                    )
+                return  # do not feed watchdog, do not send normal response
+
         if msg.arbitration_id != _ID_HEARTBEAT_CLEAR_KEY:
             # Fault clear key does NOT reset the watchdog — only control commands do.
             for sub in self._subsystems:
                 sub.feed_watchdog()
+
         if msg.arbitration_id == _ID_CONTROL_ENABLE:
             self._handle_control_enable(decoded)
             self._send_control_enable_response(decoded)
@@ -636,6 +948,96 @@ class McmSimulator:
             self._send_relay_command_response(decoded)
         elif msg.arbitration_id == _ID_HEARTBEAT_CLEAR_KEY:
             self._handle_heartbeat_clear_key(decoded)
+
+    # ------------------------------------------------------------------
+    # CI hook helpers (called from _handle_socket_client)
+    # ------------------------------------------------------------------
+
+    # Maps socket command state names → SystemState values
+    _CI_STATE_NAMES: dict[str, SystemState] = {
+        "HUMAN_CONTROL": SystemState.HUMAN_CONTROL,
+        "MCM_CONTROL": SystemState.MCM_CONTROL,
+        "FAIL_HARD": SystemState.FAIL_HARD,
+        "FAIL_OP_1": SystemState.FAIL_OPERATIONAL_1,
+        "FAIL_OP_2": SystemState.FAIL_OPERATIONAL_2,
+        "HUMAN_OVERRIDE": SystemState.HUMAN_OVERRIDE,
+    }
+
+    def _ci_find_sub(self, sub_id: int) -> SubsystemState | None:
+        for s in self._subsystems:
+            if s.subsystem_id == sub_id:
+                return s
+        return None
+
+    def _ci_set_state(self, args: str) -> str:
+        """Handle 'set-state <sub-id> <state-name>'. Returns response line."""
+        parts = args.split(None, 1)
+        if len(parts) != 2:
+            return "error: usage: set-state <sub-id> <state-name>\n"
+        try:
+            sub_id = int(parts[0])
+        except ValueError:
+            return f"error: invalid sub-id {parts[0]!r}\n"
+        state_name = parts[1].strip()
+        if state_name not in self._CI_STATE_NAMES:
+            return f"error: unknown state {state_name!r}\n"
+        sub = self._ci_find_sub(sub_id)
+        if sub is None:
+            return f"error: subsystem {sub_id} not configured\n"
+        new_state = self._CI_STATE_NAMES[state_name]
+        sub.transition(new_state, f"CI set-state {state_name}")
+        # Feed the watchdog so the forced state persists; without this the 200ms
+        # default watchdog would immediately trip back to FAIL_HARD if last_rx_time
+        # is stale (e.g. right after boot).
+        if not _is_fault_state(new_state):
+            sub.feed_watchdog()
+        logger.info("CI: set sub%d state → %s", sub_id, state_name)
+        return "ok\n"
+
+    def _ci_inject_fault(self, args: str) -> str:
+        """Handle 'inject-fault <sub-id> <fault-cause>'. Increments counter, emits FaultIncrement."""
+        parts = args.split(None, 1)
+        if len(parts) != 2:
+            return "error: usage: inject-fault <sub-id> <fault-cause>\n"
+        try:
+            sub_id = int(parts[0])
+            cause_str = parts[1].strip()
+            fault_cause = int(cause_str, 0)  # hex or decimal
+        except ValueError:
+            return f"error: invalid args {args!r}\n"
+        sub = self._ci_find_sub(sub_id)
+        if sub is None:
+            return f"error: subsystem {sub_id} not configured\n"
+        sub.fault_cause = fault_cause
+        sub.fault_count += 1
+        self._publish_fault_increment(sub)
+        logger.info("CI: inject fault 0x%02X on sub%d (count=%d)", fault_cause, sub_id, sub.fault_count)
+        return "ok\n"
+
+    def _ci_emit_error(self, args: str) -> str:
+        """Handle 'emit-error <sub-id> <error-type> <can-id>'. Emits one ErrorStatus frame."""
+        parts = args.split(None, 2)
+        if len(parts) != 3:
+            return "error: usage: emit-error <sub-id> <error-type> <can-id>\n"
+        try:
+            sub_id = int(parts[0])
+            error_type = int(parts[1], 0)
+            can_id = int(parts[2].strip(), 0)
+        except ValueError:
+            return f"error: invalid args {args!r}\n"
+        sub = self._ci_find_sub(sub_id)
+        if sub is None:
+            return f"error: subsystem {sub_id} not configured\n"
+        self._publish_error_status(
+            bus_address=self._args.bus_address,
+            subsystem_id=sub.subsystem_id,
+            error_type=error_type,
+            section_id=0,
+            interface_id=0,
+            can_id=can_id,
+        )
+        logger.info("CI: emit ErrorStatus type=%d can_id=0x%03X for sub%d", error_type, can_id, sub_id)
+        return "ok\n"
 
     # ------------------------------------------------------------------
     # Unix socket e-stop server
@@ -706,6 +1108,29 @@ class McmSimulator:
 
                 states = {str(s.subsystem_id): s.state.name for s in self._subsystems}
                 writer.write((_json.dumps(states) + "\n").encode())
+            elif cmd.startswith("set-state "):
+                writer.write(self._ci_set_state(cmd[len("set-state "):]).encode())
+            elif cmd.startswith("inject-fault "):
+                writer.write(self._ci_inject_fault(cmd[len("inject-fault "):]).encode())
+            elif cmd.startswith("emit-error "):
+                writer.write(self._ci_emit_error(cmd[len("emit-error "):]).encode())
+            elif cmd == "query-detailed":
+                import json as _json
+                import time as _time
+                now = _time.monotonic()
+                detail = {
+                    str(s.subsystem_id): {
+                        "state": s.state.name,
+                        "state_int": int(s.state),
+                        "fault_count": s.fault_count,
+                        "fault_cause": s.fault_cause,
+                        "last_rx_age_ms": round((now - s.last_rx_time) * 1000, 1),
+                        "counter": s.counter,
+                        "estop_latched": s.estop_latched,
+                    }
+                    for s in self._subsystems
+                }
+                writer.write((_json.dumps(detail) + "\n").encode())
             else:
                 logger.warning("Unknown socket command: %r", cmd)
                 writer.write(b"unknown command\n")
@@ -753,6 +1178,7 @@ class McmSimulator:
             tg.create_task(self._fault_clear_seed_loop())
             tg.create_task(self._can_receive_loop())
             tg.create_task(self._socket_server())
+            tg.create_task(self._report_data_loop())
 
 
 def _parse_args() -> argparse.Namespace:
@@ -760,10 +1186,13 @@ def _parse_args() -> argparse.Namespace:
         description="Simulated MCM CAN node (sygnal protocol)"
     )
     parser.add_argument("--can-interface", default="vcan0")
-    # 2000ms default: Python asyncio event loop scheduling adds hundreds of ms
-    # jitter that real MCM firmware doesn't have. Real hardware uses 200ms.
-    parser.add_argument("--watchdog-timeout-ms", type=int, default=2000)
+    # 200ms matches real MCM firmware (sygnal_docs v2.1.1 fault 0x30 "configured timeout").
+    # Asyncio jitter is handled by tightened recv (20ms) and watchdog-check (10ms) intervals,
+    # leaving ~170ms of slack. Raise to 2000ms for local dev on slow machines if needed.
+    parser.add_argument("--watchdog-timeout-ms", type=int, default=200)
     parser.add_argument("--heartbeat-rate-hz", type=float, default=15.0)
+    parser.add_argument("--report-rate-hz", type=float, default=10.0,
+                        help="Rate (Hz) for synthetic ReportData signal broadcasts")
     parser.add_argument(
         "--devices",
         default=None,
