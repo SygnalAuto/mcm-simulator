@@ -34,6 +34,9 @@ class DeviceSpec:
     bl_patch: int = 0
 
     def __post_init__(self) -> None:
+        # MCM has dual subsystems (0, 1); CB and IO are single subsystem (0 only)
+        if self.subsystem_ids == [0, 1] and self.product_type in ("cb", "io"):
+            self.subsystem_ids = [0]
         if self.serial_number == 0:
             # Auto-generate a non-zero serial derived from bus address
             self.serial_number = 1000 + self.bus_address

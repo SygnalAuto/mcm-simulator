@@ -55,11 +55,11 @@ pip install ./mcm-simulator
 ## Run
 
 ```sh
-# Start with defaults (vcan0, 2000ms watchdog, 15Hz heartbeat, subsystems 0,1)
+# Start with defaults (vcan0, 200ms watchdog, 15Hz heartbeat, subsystems 0,1)
 mcm-simulator
 
-# Custom interface and watchdog
-mcm-simulator --can-interface vcan0 --watchdog-timeout-ms 200
+# Raise watchdog for asyncio jitter on slow machines (real MCM uses 200ms)
+mcm-simulator --watchdog-timeout-ms 2000
 
 # Single subsystem
 mcm-simulator --subsystem-ids 0
@@ -73,7 +73,7 @@ mcm-simulator --help
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--can-interface` | `vcan0` | SocketCAN interface name |
-| `--watchdog-timeout-ms` | `2000` | Watchdog timeout in ms (real MCM uses 200ms; Python asyncio jitter requires higher value in simulation) |
+| `--watchdog-timeout-ms` | `200` | Watchdog timeout in ms — matches real MCM (sygnal_docs v2.1.1). Raise to 2000ms on slow machines if asyncio jitter causes false FAIL_HARD trips. |
 | `--heartbeat-rate-hz` | `15.0` | Heartbeat publish rate |
 | `--bus-address` | `1` | MCM bus address in CAN frames |
 | `--subsystem-ids` | `0,1` | Comma-separated subsystem IDs to simulate |
@@ -92,6 +92,38 @@ echo "recover-sub1"   | nc -U /tmp/simulated-mcm.sock   # recover sub1
 echo "query"          | nc -U /tmp/simulated-mcm.sock   # get JSON state of all subsystems
 ```
 
+### CI Hooks — deterministic state and fault injection
+
+The following commands let CI tests drive the simulator into specific protocol states and verify how interfacing applications react.
+
+```sh
+SOCK=/tmp/simulated-mcm-1.sock
+
+# Force subsystem 0 into any documented state
+echo "set-state 0 FAIL_HARD"       | nc -U $SOCK   # → FAIL_HARD (254)
+echo "set-state 0 HUMAN_CONTROL"   | nc -U $SOCK   # → HUMAN_CONTROL (0)
+echo "set-state 0 MCM_CONTROL"     | nc -U $SOCK   # → MCM_CONTROL (1)
+echo "set-state 0 FAIL_OP_1"       | nc -U $SOCK   # → FAIL_OPERATIONAL_1 (241)
+echo "set-state 0 FAIL_OP_2"       | nc -U $SOCK   # → FAIL_OPERATIONAL_2 (242)
+echo "set-state 0 HUMAN_OVERRIDE"  | nc -U $SOCK   # → HUMAN_OVERRIDE (253)
+
+# Inject a specific fault cause (increments counter, emits FaultIncrement frame)
+echo "inject-fault 0 0x30"         | nc -U $SOCK   # Heartbeat Timeout fault on sub0
+echo "inject-fault 1 0x01"         | nc -U $SOCK   # Emergency Stop fault on sub1
+
+# Emit a one-shot ErrorStatus frame (does not change state)
+echo "emit-error 0 1 0x60"         | nc -U $SOCK   # CRC Error on ControlEnable
+echo "emit-error 0 6 0x160"        | nc -U $SOCK   # State Error on ControlCommand
+
+# Detailed JSON query (all subsystems)
+echo "query-detailed"              | nc -U $SOCK
+# Returns: {"0": {"state": "HUMAN_CONTROL", "state_int": 0, "fault_count": 0,
+#                 "fault_cause": 0, "last_rx_age_ms": 12.3, "counter": 42,
+#                 "estop_latched": false}, ...}
+```
+
+All commands respond with `ok` on success or `error: <reason>` on failure.
+
 ## Programmatic use (CI)
 
 ```python
@@ -102,7 +134,7 @@ from mcm_simulator import McmSimulator, SystemState
 def make_args(**kwargs):
     defaults = dict(
         can_interface="vcan0",
-        watchdog_timeout_ms=2000,
+        watchdog_timeout_ms=200,
         heartbeat_rate_hz=15.0,
         bus_address=1,
         subsystem_ids=[0, 1],

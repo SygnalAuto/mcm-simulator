@@ -17,6 +17,7 @@ from mcm_simulator.simulator import (
     McmSimulator,
     SystemState,
     _ID_CONTROL_CMD_RESP,
+    _ID_ERROR_STATUS,
     _ID_HEARTBEAT,
     _ID_HEARTBEAT_CLEAR_SEED,
     _ID_RELAY_CMD_RESP,
@@ -56,6 +57,28 @@ def _make_can_frame(db, name: str, signals: dict) -> can.Message:
         data=bytes(raw),
         is_extended_id=False,
     )
+
+
+class TestSystemStateEnum:
+    def test_enum_has_six_members(self) -> None:
+        assert len(SystemState) == 6
+
+    def test_enum_values(self) -> None:
+        assert SystemState.HUMAN_CONTROL == 0
+        assert SystemState.MCM_CONTROL == 1
+        assert SystemState.FAIL_OPERATIONAL_1 == 241
+        assert SystemState.FAIL_OPERATIONAL_2 == 242
+        assert SystemState.HUMAN_OVERRIDE == 253
+        assert SystemState.FAIL_HARD == 254
+
+    def test_new_values_in_heartbeat_dbc_range(self) -> None:
+        from mcm_simulator.simulator import _load_dbc
+        db = _load_dbc()
+        hb = db.get_message_by_name("Heartbeat")
+        ss_signal = hb.get_signal_by_name("SystemState")
+        # All six SystemState values must fit in the SystemState signal's bit-width
+        for state in SystemState:
+            assert 0 <= int(state) <= (1 << ss_signal.length) - 1, f"{state} out of range"
 
 
 class TestInitialState:
@@ -154,10 +177,13 @@ class TestWatchdog:
         asyncio.run(run_one_cycle())
         assert all(s.state == SystemState.FAIL_HARD for s in sim._subsystems)
 
-    def test_default_watchdog_timeout_is_2000ms(self):
-        """Simulated MCM default watchdog should be 2000ms for asyncio tolerance."""
-        sim = _make_sim(args=_make_args(watchdog_timeout_ms=2000))
-        assert sim._subsystems[0].watchdog_timeout_s == 2.0
+    def test_default_watchdog_timeout_is_200ms(self):
+        """Default watchdog matches real MCM firmware (200ms per sygnal_docs v2.1.1)."""
+        import sys
+        from unittest.mock import patch
+        with patch.object(sys, "argv", ["mcm-simulator"]):
+            args = _parse_args()
+        assert args.watchdog_timeout_ms == 200
 
     def test_watchdog_survives_after_fault_clear_with_commands(self):
         """After fault clear, MCM stays in HUMAN_CONTROL if 0x160 frames keep arriving."""
@@ -197,6 +223,10 @@ class TestWatchdog:
 
     def test_valid_frame_resets_watchdog(self):
         sim = _make_sim()
+        # Must be in HUMAN_CONTROL — in FAIL_HARD control frames are rejected and
+        # watchdog is intentionally NOT fed (per Task 5 docs compliance fix).
+        for s in sim._subsystems:
+            s.state = SystemState.HUMAN_CONTROL
         old_time = time.monotonic() - 0.5
         for s in sim._subsystems:
             s.last_rx_time = old_time
@@ -391,6 +421,9 @@ class TestPartialFailure:
 class TestControlCommandResponse:
     def test_control_command_response_echoes_value_with_crc(self):
         sim = _make_sim()
+        # Must be in HUMAN_CONTROL — FAIL_HARD rejects control frames
+        for s in sim._subsystems:
+            s.state = SystemState.HUMAN_CONTROL
         frame = _make_can_frame(
             sim._db,
             "ControlCommand",
@@ -403,16 +436,22 @@ class TestControlCommandResponse:
             },
         )
         sim._handle_can_message(frame)
-        assert sim._bus.send.called
-        sent_msg: can.Message = sim._bus.send.call_args[0][0]
-        assert sent_msg.arbitration_id == _ID_CONTROL_CMD_RESP
-        raw = bytearray(sent_msg.data)
+        # Responses are emitted per-subsystem; find first ControlCommandResponse
+        resp_msgs = [
+            call.args[0] for call in sim._bus.send.call_args_list
+            if call.args[0].arbitration_id == _ID_CONTROL_CMD_RESP
+        ]
+        assert len(resp_msgs) == len(sim._subsystems)
+        raw = bytearray(resp_msgs[0].data)
         assert generate_crc8(raw) == raw[7]
 
 
 class TestRelayCommandResponse:
     def test_relay_command_response_with_correct_crc(self):
         sim = _make_sim()
+        # Must be in HUMAN_CONTROL — FAIL_HARD rejects relay frames
+        for s in sim._subsystems:
+            s.state = SystemState.HUMAN_CONTROL
         frame = _make_can_frame(
             sim._db,
             "RelayCommand",
@@ -423,10 +462,12 @@ class TestRelayCommandResponse:
             },
         )
         sim._handle_can_message(frame)
-        assert sim._bus.send.called
-        sent_msg: can.Message = sim._bus.send.call_args[0][0]
-        assert sent_msg.arbitration_id == _ID_RELAY_CMD_RESP
-        raw = bytearray(sent_msg.data)
+        resp_msgs = [
+            call.args[0] for call in sim._bus.send.call_args_list
+            if call.args[0].arbitration_id == _ID_RELAY_CMD_RESP
+        ]
+        assert len(resp_msgs) == len(sim._subsystems)
+        raw = bytearray(resp_msgs[0].data)
         assert generate_crc8(raw) == raw[7]
         decoded = sim._db.decode_message(_ID_RELAY_CMD_RESP, bytes(raw))
         assert int(decoded["Enable"]) == 1
@@ -682,3 +723,174 @@ class TestSocketPathDefault:
         )
         args = _parse_args()
         assert args.socket_path == "/run/my-mcm.sock"
+
+
+# ---------------------------------------------------------------------------
+# ErrorStatus (0x30) emission
+# ---------------------------------------------------------------------------
+
+def _sent_frame_ids(sim: McmSimulator) -> list[int]:
+    return [call.args[0].arbitration_id for call in sim._bus.send.call_args_list]
+
+
+def _sent_frames_by_id(sim: McmSimulator, frame_id: int) -> list[bytes]:
+    return [
+        bytes(call.args[0].data)
+        for call in sim._bus.send.call_args_list
+        if call.args[0].arbitration_id == frame_id
+    ]
+
+
+class TestErrorStatusEmission:
+    def test_crc_mismatch_emits_error_status(self) -> None:
+        sim = _make_sim()
+        # Build a valid ControlEnable frame then corrupt the CRC
+        frame = _make_can_frame(
+            sim._db,
+            "ControlEnable",
+            {"BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 1},
+        )
+        bad_data = bytearray(frame.data)
+        bad_data[7] ^= 0xFF  # flip all CRC bits
+        bad_frame = can.Message(
+            arbitration_id=frame.arbitration_id,
+            data=bytes(bad_data),
+            is_extended_id=False,
+        )
+        sim._handle_can_message(bad_frame)
+        error_frames = _sent_frames_by_id(sim, _ID_ERROR_STATUS)
+        assert len(error_frames) == 1
+        decoded = sim._db.decode_message(_ID_ERROR_STATUS, error_frames[0], decode_choices=False)
+        assert decoded["Error_Type"] == 1  # CRC Error
+
+    def _make_config_frame(bus_address: int, interface_id: int, section_id: int) -> can.Message:
+        """Build a raw ConfigGetSetCommand (0x400) frame.
+
+        DBC layout (see mcm_Configuration.dbc):
+          byte 0: SubsystemID[7], BusAddress[6:0]
+          byte 1: InterfaceID[7:5], SectionID[4:0]
+          byte 2: Config_GetSet[7], ParameterID[6:0]
+          bytes 3-6: float32 value (all zeros)
+          byte 7: CRC
+        """
+        raw = bytearray(8)
+        raw[0] = bus_address & 0x7F
+        raw[1] = ((interface_id & 0x07) << 5) | (section_id & 0x1F)
+        raw[2] = 0  # GetSet=0, ParameterID=0
+        # bytes 3-6 = 0.0 float32
+        from mcm_simulator.crc8 import apply_crc8
+        apply_crc8(raw)
+        return can.Message(arbitration_id=1024, data=bytes(raw), is_extended_id=False)
+
+    def test_invalid_section_id_in_config_emits_error_status(self) -> None:
+        """Section ID 18 (0x12) is not in the known VAL_TABLE → Error_Type 2."""
+        sim = _make_sim()
+        # Section 18 = 0x12 is not in Error.dbc Config_SectionID VAL_TABLE
+        frame = TestErrorStatusEmission._make_config_frame(
+            bus_address=1, interface_id=0, section_id=18
+        )
+        sim._handle_can_message(frame)
+        error_frames = _sent_frames_by_id(sim, _ID_ERROR_STATUS)
+        assert len(error_frames) >= 1
+        decoded = sim._db.decode_message(_ID_ERROR_STATUS, error_frames[0], decode_choices=False)
+        assert decoded["Error_Type"] == 2  # Section ID Invalid
+
+    def test_invalid_interface_id_in_config_emits_error_status(self) -> None:
+        """Interface ID 7 > max physical interface (6) → Error_Type 3."""
+        sim = _make_sim()
+        frame = TestErrorStatusEmission._make_config_frame(
+            bus_address=1, interface_id=7, section_id=0
+        )
+        sim._handle_can_message(frame)
+        error_frames = _sent_frames_by_id(sim, _ID_ERROR_STATUS)
+        assert len(error_frames) >= 1
+        decoded = sim._db.decode_message(_ID_ERROR_STATUS, error_frames[0], decode_choices=False)
+        assert decoded["Error_Type"] == 3  # Interface ID Invalid
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Control/Relay rejection in FAIL_HARD + per-subsystem responses
+# ---------------------------------------------------------------------------
+
+class TestControlRejectionInFaultState:
+    def _put_in_fail_hard(self, sim: McmSimulator) -> None:
+        for s in sim._subsystems:
+            s.state = SystemState.FAIL_HARD
+
+    def _put_in_human_control(self, sim: McmSimulator) -> None:
+        for s in sim._subsystems:
+            s.state = SystemState.HUMAN_CONTROL
+
+    def test_control_enable_in_fail_hard_emits_error_status(self) -> None:
+        sim = _make_sim()
+        self._put_in_fail_hard(sim)
+        t_before = [s.last_rx_time for s in sim._subsystems]
+        frame = _make_can_frame(
+            sim._db, "ControlEnable",
+            {"BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 1},
+        )
+        sim._handle_can_message(frame)
+        error_frames = _sent_frames_by_id(sim, _ID_ERROR_STATUS)
+        assert len(error_frames) >= 1
+        decoded = sim._db.decode_message(_ID_ERROR_STATUS, error_frames[0], decode_choices=False)
+        assert decoded["Error_Type"] == 6  # State Error
+        # Normal ControlEnableResponse must NOT be emitted
+        from mcm_simulator.simulator import _ID_CONTROL_ENABLE_RESP
+        assert _sent_frames_by_id(sim, _ID_CONTROL_ENABLE_RESP) == []
+        # Watchdog must NOT have been fed
+        for s, t in zip(sim._subsystems, t_before):
+            assert s.last_rx_time == t
+
+    def test_control_command_in_fail_hard_emits_error_status(self) -> None:
+        sim = _make_sim()
+        self._put_in_fail_hard(sim)
+        frame = _make_can_frame(
+            sim._db, "ControlCommand",
+            {"BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Count8": 0, "Value": 0.0},
+        )
+        sim._handle_can_message(frame)
+        error_frames = _sent_frames_by_id(sim, _ID_ERROR_STATUS)
+        assert len(error_frames) >= 1
+        decoded = sim._db.decode_message(_ID_ERROR_STATUS, error_frames[0], decode_choices=False)
+        assert decoded["Error_Type"] == 6
+        assert _sent_frames_by_id(sim, _ID_CONTROL_CMD_RESP) == []
+
+    def test_relay_command_in_fail_hard_emits_error_status(self) -> None:
+        sim = _make_sim()
+        self._put_in_fail_hard(sim)
+        frame = _make_can_frame(
+            sim._db, "RelayCommand",
+            {"BusAddress": 1, "SubsystemID": 0, "Enable": 1},
+        )
+        sim._handle_can_message(frame)
+        error_frames = _sent_frames_by_id(sim, _ID_ERROR_STATUS)
+        assert len(error_frames) >= 1
+        decoded = sim._db.decode_message(_ID_ERROR_STATUS, error_frames[0], decode_choices=False)
+        assert decoded["Error_Type"] == 6
+        assert _sent_frames_by_id(sim, _ID_RELAY_CMD_RESP) == []
+
+    def test_control_enable_in_human_control_emits_one_response_per_subsystem(self) -> None:
+        """In HUMAN_CONTROL → MCM_CONTROL, one ControlEnableResponse per subsystem."""
+        sim = _make_sim()
+        self._put_in_human_control(sim)
+        frame = _make_can_frame(
+            sim._db, "ControlEnable",
+            {"BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Enable": 1},
+        )
+        sim._handle_can_message(frame)
+        from mcm_simulator.simulator import _ID_CONTROL_ENABLE_RESP
+        resp_frames = _sent_frames_by_id(sim, _ID_CONTROL_ENABLE_RESP)
+        assert len(resp_frames) == len(sim._subsystems)
+
+    def test_rejected_frame_does_not_feed_watchdog(self) -> None:
+        """A frame rejected due to fault state must not reset the watchdog timer."""
+        sim = _make_sim()
+        self._put_in_fail_hard(sim)
+        original_rx_times = [s.last_rx_time for s in sim._subsystems]
+        frame = _make_can_frame(
+            sim._db, "ControlCommand",
+            {"BusAddress": 1, "SubSystemID": 0, "InterfaceID": 0, "Count8": 0, "Value": 0.0},
+        )
+        sim._handle_can_message(frame)
+        for s, orig in zip(sim._subsystems, original_rx_times):
+            assert s.last_rx_time == orig, "Watchdog was fed by rejected frame"
